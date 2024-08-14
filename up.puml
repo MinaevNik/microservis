@@ -1,0 +1,42 @@
+@startuml Процесс обновления
+title Процесс обновления прошивки с взаимодействием Backend и Frontend
+
+actor Пользователь
+participant Frontend
+participant Backend
+participant Raspberry
+
+Пользователь -> Raspberry: Вставляет флешку
+activate Raspberry
+
+Raspberry -> Backend: Уведомить о вставке флешки
+activate Backend
+
+Backend -> Raspberry: Инициировать поиск файлов на USB-диске
+
+Raspberry -> Raspberry: Найти файлы на USB-диске
+Raspberry -> Backend: Список найденных файлов
+
+Backend -> Raspberry: Поиск валидных zip файлов
+Raspberry -> Raspberry: Проверка валидности zip файлов
+Raspberry -> Backend: Отправить список валидных zip файлов
+
+Backend -> Frontend: Отправить список валидных zip файлов
+activate Frontend
+
+Frontend -> Пользователь: Показать список zip файлов
+Пользователь -> Frontend: Выбор zip файла
+
+Frontend -> Backend: Отправить выбранный zip файл
+deactivate Frontend
+
+Backend -> Raspberry: Отправить выбранный zip файл
+deactivate Backend
+
+Raspberry -> Raspberry: Очистить "dt_backup"
+Raspberry -> Raspberry: Копировать файлы из "dt_firmware" в "dt_backup"
+Raspberry -> Raspberry: Очистить "dt_firmware"
+Raspberry -> Raspberry: Распаковать выбранный zip файл в "dt_firmware"
+
+deactivate Raspberry
+@enduml

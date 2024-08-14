@@ -2,26 +2,47 @@ package api
 
 import (
     "encoding/json"
+    "fmt"
     "log"
     "net/http"
+    "os"
+    "strings"
     "time"
-
+    "servis/pkg/update"
+    "servis/pkg/shutdown" // Импорт пакета shutdown
+    "servis/pkg/wifi"     // Импорт пакета wifi
     "github.com/gorilla/mux"
-    "servis/pkg/shutdown"
-    "servis/pkg/wifi"
+    "archive/zip"
 )
 
+var selectedZipFilePath string // переменная для хранения выбранного файла прошивки
+
+// NetworkSelection представляет структуру для выбора Wi-Fi сети
 type NetworkSelection struct {
     Name     string `json:"name"`
     Password string `json:"password"`
 }
 
+// ShutdownRequest представляет структуру для запроса на выключение устройства
 type ShutdownRequest struct {
     Comment string `json:"comment"`
 }
 
+// RebootRequest представляет структуру для запроса на перезагрузку устройства
 type RebootRequest struct {
     Comment string `json:"comment"`
+}
+
+// FileInfo содержит информацию о каждом файле внутри ZIP-файла
+type FileInfo struct {
+    Source      string `json:"source"`
+    FileVersion string `json:"file_version"`
+}
+
+// ZipFileInfo содержит информацию о ZIP-файле и файлах с их версиями внутри
+type ZipFileInfo struct {
+    Path   string     `json:"path"`
+    Files  []FileInfo `json:"files"`
 }
 
 // RegisterRoutes регистрирует маршруты для HTTP эндпоинтов.
@@ -30,6 +51,9 @@ func RegisterRoutes(r *mux.Router) {
     r.HandleFunc("/networks/connect", ConnectNetwork).Methods("POST")
     r.HandleFunc("/shutdown", HandleShutdown).Methods("POST")
     r.HandleFunc("/reboot", HandleReboot).Methods("POST")
+    r.HandleFunc("/usb/files", GetUSBFiles).Methods("GET")
+    r.HandleFunc("/firmware/update", PerformFirmwareUpdate).Methods("POST")
+    r.HandleFunc("/firmware/rollback", RollbackFirmwareHandler).Methods("POST")
 }
 
 // GetNetworks обрабатывает запрос на получение списка доступных сетей.
@@ -133,6 +157,121 @@ func HandleReboot(w http.ResponseWriter, r *http.Request) {
     }
 
     http.Error(w, "invalid comment", http.StatusBadRequest)
+}
+
+// GetUSBFiles возвращает список ZIP-файлов на USB-устройствах с информацией о файлах и их версиях.
+func GetUSBFiles(w http.ResponseWriter, r *http.Request) {
+    usbDevices, err := update.GetUSBMountPoints()
+    if err != nil {
+        http.Error(w, fmt.Sprintf("failed to get USB devices: %v", err), http.StatusInternalServerError)
+        return
+    }
+
+    var zipFilesInfo []ZipFileInfo
+    for _, usbPath := range usbDevices {
+        files, err := os.ReadDir(usbPath)
+        if err != nil {
+            http.Error(w, fmt.Sprintf("failed to read directory %s: %v", usbPath, err), http.StatusInternalServerError)
+            return
+        }
+
+        for _, file := range files {
+            if file.Type().IsRegular() && strings.HasSuffix(file.Name(), ".zip") {
+                zipFilePath := usbPath + "/" + file.Name()
+                fileInfos, err := extractFilesInfoFromZip(zipFilePath)
+                if err != nil {
+                    // Если возникла ошибка при извлечении информации, пропустим этот файл
+                    log.Printf("failed to extract file info from %s: %v", zipFilePath, err)
+                    continue
+                }
+                zipFilesInfo = append(zipFilesInfo, ZipFileInfo{
+                    Path:  zipFilePath,
+                    Files: fileInfos,
+                })
+            }
+        }
+    }
+
+    if len(zipFilesInfo) == 0 {
+        http.Error(w, "no zip files found", http.StatusNotFound)
+        return
+    }
+
+    w.Header().Set("Content-Type", "application/json")
+    json.NewEncoder(w).Encode(zipFilesInfo)
+}
+
+// extractFilesInfoFromZip извлекает информацию о файлах из JSON внутри ZIP-файла
+func extractFilesInfoFromZip(zipFilePath string) ([]FileInfo, error) {
+    zipReader, err := zip.OpenReader(zipFilePath)
+    if err != nil {
+        return nil, fmt.Errorf("failed to open zip file: %w", err)
+    }
+    defer zipReader.Close()
+
+    firmwareInfo, err := update.FindValidFirmware(&zipReader.Reader)
+    if err != nil {
+        return nil, fmt.Errorf("failed to find valid firmware in zip file: %w", err)
+    }
+
+    var fileInfos []FileInfo
+    for _, file := range firmwareInfo.Files {
+        fileInfos = append(fileInfos, FileInfo{
+            Source:      file.Source,
+            FileVersion: file.FileVersion,
+        })
+    }
+
+    return fileInfos, nil
+}
+
+// PerformFirmwareUpdate обрабатывает запрос на выполнение обновления прошивки.
+func PerformFirmwareUpdate(w http.ResponseWriter, r *http.Request) {
+    var req struct {
+        SelectedFile string `json:"selected_file"`
+    }
+    if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+        http.Error(w, "invalid request payload", http.StatusBadRequest)
+        return
+    }
+
+    if req.SelectedFile == "" {
+        http.Error(w, "no file selected", http.StatusBadRequest)
+        return
+    }
+
+    selectedZipFilePath = req.SelectedFile
+    versionFilePath := "/root/dt_backend/installed_versions.json"
+    backupDir := "/root/dt_backend/UpdateBackup"
+
+    err := update.UpdateFirmware(selectedZipFilePath, versionFilePath, backupDir)
+    if err != nil {
+        http.Error(w, fmt.Sprintf("failed to update firmware: %v", err), http.StatusInternalServerError)
+        return
+    }
+    w.WriteHeader(http.StatusOK)
+    w.Write([]byte("Firmware update completed successfully"))
+}
+
+// RollbackFirmwareHandler обрабатывает запрос на откат прошивки.
+func RollbackFirmwareHandler(w http.ResponseWriter, r *http.Request) {
+    backupDir := "/root/dt_backend/UpdateBackup"
+
+    versionFilePath := "/root/dt_backend/installed_versions.json"
+    installedVersions, err := update.LoadInstalledVersions(versionFilePath)
+    if err != nil {
+        http.Error(w, fmt.Sprintf("Failed to load installed versions: %v", err), http.StatusInternalServerError)
+        return
+    }
+
+    err = update.RollbackFirmware(backupDir, installedVersions)
+    if err != nil {
+        http.Error(w, fmt.Sprintf("Failed to rollback firmware: %v", err), http.StatusInternalServerError)
+        return
+    }
+
+    w.WriteHeader(http.StatusOK)
+    w.Write([]byte("Firmware rollback completed successfully"))
 }
 
 // StartServer запускает HTTP сервер.
