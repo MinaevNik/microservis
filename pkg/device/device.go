@@ -1,14 +1,16 @@
 package device
 
 import (
-    "context"
+    //"context"
     "fmt"
     "log"
     "os"
     "os/exec"
+    "path/filepath"
     "strings"
+    "time"
 
-    "github.com/jochenvg/go-udev"
+    "github.com/fsnotify/fsnotify"
 )
 
 // CreateMediaDirectory создаёт директорию /media, если она отсутствует
@@ -24,57 +26,90 @@ func CreateMediaDirectory() error {
 
 // cleanDeviceName очищает имя устройства от лишних символов
 func cleanDeviceName(name string) string {
-    return strings.TrimLeft(name, "│─└├")
+    return strings.TrimLeft(filepath.Base(name), "│─└├")
 }
 
 // mountDevice монтирует устройство
 func mountDevice(device string) {
-    device = cleanDeviceName(device)  // Очистка имени устройства
-    mountPoint := fmt.Sprintf("/media/%s", device)
+    deviceName := cleanDeviceName(device)
+    mountPoint := fmt.Sprintf("/media/%s", deviceName)
+
+    // Создаем точку монтирования, если она не существует
     err := os.MkdirAll(mountPoint, 0755)
     if err != nil {
         log.Fatalf("Failed to create mount point %s: %v", mountPoint, err)
     }
 
-    devicePath := fmt.Sprintf("/dev/%s", device)
-    fmt.Printf("Attempting to mount %s to %s\n", devicePath, mountPoint)
-    cmd := exec.Command("sudo", "mount", devicePath, mountPoint) // Использование sudo для монтирования
-    output, err := cmd.CombinedOutput()
+    // Определяем, есть ли разделы у устройства
+    cmd := exec.Command("lsblk", "-no", "MOUNTPOINT", device)
+    output, err := cmd.Output()
     if err != nil {
-        log.Fatalf("Failed to mount device %s: %v\n%s", devicePath, err, output)
+        log.Fatalf("Failed to list partitions for device %s: %v", device, err)
     }
 
-    fmt.Printf("Device %s mounted at %s\n", devicePath, mountPoint)
+    // Если устройство уже смонтировано, выходим
+    if strings.TrimSpace(string(output)) != "" {
+        log.Printf("Device %s or its partitions are already mounted.", device)
+        return
+    }
+
+    // Если нет разделов, монтируем само устройство
+    if err := exec.Command("mount", device, mountPoint).Run(); err == nil {
+        log.Printf("Successfully mounted %s to %s", device, mountPoint)
+        return
+    }
+
+    // Если монтирование устройства не удалось, пробуем монтировать его разделы
+    partDevice := fmt.Sprintf("%s1", device)
+    if err := exec.Command("mount", partDevice, mountPoint).Run(); err != nil {
+        log.Fatalf("Failed to mount device or partition %s: %v", partDevice, err)
+    }
+    log.Printf("Successfully mounted %s to %s", partDevice, mountPoint)
 }
 
-// Start запускает мониторинг устройств с использованием udev
+// Start запускает процесс мониторинга устройств
 func Start() {
     err := CreateMediaDirectory()
     if err != nil {
         log.Fatalf("Failed to create /media directory: %v", err)
     }
 
-    udev := udev.Udev{}
-    monitor := udev.NewMonitorFromNetlink("udev")
-    monitor.FilterAddMatchSubsystemDevtype("block", "disk")
-
-    ctx := context.Background() // Создаем контекст
-    deviceChan, errChan, err := monitor.DeviceChan(ctx)
+    watcher, err := fsnotify.NewWatcher()
     if err != nil {
-        log.Fatalf("Failed to start device monitor: %v", err)
+        log.Fatalf("Failed to create watcher: %v", err)
+    }
+    defer watcher.Close()
+
+    done := make(chan bool)
+    go func() {
+        for {
+            select {
+            case event, ok := <-watcher.Events:
+                if !ok {
+                    return
+                }
+                if event.Op&fsnotify.Create == fsnotify.Create {
+                    if strings.HasPrefix(event.Name, "/dev/sd") || strings.HasPrefix(event.Name, "/dev/nvme") {
+                        log.Printf("Detected new device: %s", event.Name)
+                        // Небольшая задержка для корректной инициализации устройства
+                        time.Sleep(1 * time.Second)
+                        mountDevice(event.Name)
+                    }
+                }
+            case err, ok := <-watcher.Errors:
+                if !ok {
+                    return
+                }
+                log.Printf("Watcher error: %v", err)
+            }
+        }
+    }()
+
+    err = watcher.Add("/dev")
+    if err != nil {
+        log.Fatalf("Failed to add /dev to watcher: %v", err)
     }
 
     log.Println("Device monitoring started...")
-
-    for {
-        select {
-        case device := <-deviceChan:
-            if device.Action() == "add" && device.IsInitialized() {
-                log.Printf("Device added: %s", device.Syspath())
-                mountDevice(device.Devnode())
-            }
-        case err := <-errChan:
-            log.Printf("Device monitor error: %v", err)
-        }
-    }
+    <-done
 }

@@ -9,40 +9,51 @@ import (
     "strings"
     "time"
     "servis/pkg/update"
-    "servis/pkg/shutdown" // Импорт пакета shutdown
-    "servis/pkg/wifi"     // Импорт пакета wifi
+    "servis/pkg/shutdown"
+    "servis/pkg/wifi"
     "github.com/gorilla/mux"
     "archive/zip"
 )
 
 var selectedZipFilePath string // переменная для хранения выбранного файла прошивки
 
-// NetworkSelection представляет структуру для выбора Wi-Fi сети
 type NetworkSelection struct {
     Name     string `json:"name"`
     Password string `json:"password"`
 }
 
-// ShutdownRequest представляет структуру для запроса на выключение устройства
 type ShutdownRequest struct {
     Comment string `json:"comment"`
 }
 
-// RebootRequest представляет структуру для запроса на перезагрузку устройства
 type RebootRequest struct {
     Comment string `json:"comment"`
 }
 
-// FileInfo содержит информацию о каждом файле внутри ZIP-файла
 type FileInfo struct {
     Source      string `json:"source"`
     FileVersion string `json:"file_version"`
 }
 
-// ZipFileInfo содержит информацию о ZIP-файле и файлах с их версиями внутри
 type ZipFileInfo struct {
     Path   string     `json:"path"`
     Files  []FileInfo `json:"files"`
+}
+
+// enableCORS добавляет необходимые заголовки для поддержки CORS.
+func enableCORS(next http.Handler) http.Handler {
+    return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+        w.Header().Set("Access-Control-Allow-Origin", "*")
+        w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+        w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
+
+        if r.Method == "OPTIONS" {
+            w.WriteHeader(http.StatusOK)
+            return
+        }
+
+        next.ServeHTTP(w, r)
+    })
 }
 
 // RegisterRoutes регистрирует маршруты для HTTP эндпоинтов.
@@ -180,7 +191,6 @@ func GetUSBFiles(w http.ResponseWriter, r *http.Request) {
                 zipFilePath := usbPath + "/" + file.Name()
                 fileInfos, err := extractFilesInfoFromZip(zipFilePath)
                 if err != nil {
-                    // Если возникла ошибка при извлечении информации, пропустим этот файл
                     log.Printf("failed to extract file info from %s: %v", zipFilePath, err)
                     continue
                 }
@@ -274,13 +284,16 @@ func RollbackFirmwareHandler(w http.ResponseWriter, r *http.Request) {
     w.Write([]byte("Firmware rollback completed successfully"))
 }
 
-// StartServer запускает HTTP сервер.
+// StartServer запускает HTTP сервер с поддержкой CORS.
 func StartServer() {
     r := mux.NewRouter()
     RegisterRoutes(r)
 
+    // Применяем CORS middleware ко всем маршрутам
+    corsRouter := enableCORS(r)
+
     log.Println("server is starting...")
-    if err := http.ListenAndServe(":4444", r); err != nil {
+    if err := http.ListenAndServe(":4444", corsRouter); err != nil {
         log.Fatalf("server failed to start: %v", err)
     }
 }
